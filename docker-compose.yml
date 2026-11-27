@@ -1,0 +1,115 @@
+# Surveillance platform: PostgreSQL, Redis, Admin API, React web app and Monitoring Engine.
+# Copy .env.example to .env and set the required secrets before running `docker compose up -d --build`.
+
+name: surveillance
+
+x-engine-env: &engine-env
+  API_BASE_URL: http://api:8080
+  SERVICE_API_KEY: ${SERVICE_API_KEY:?set SERVICE_API_KEY in .env}
+  YOLO_WEIGHTS: ${YOLO_WEIGHTS:-/models/yolo11-face.pt}
+  YOLO_FACE_CLASS_ID: ${YOLO_FACE_CLASS_ID:-0}
+  INFERENCE_DEVICE: ${INFERENCE_DEVICE:-cpu}
+  ENGINE_SHARD_COUNT: ${ENGINE_SHARD_COUNT:-1}
+  FRAME_STRIDE: ${FRAME_STRIDE:-3}
+  DETECT_IMGSZ: ${DETECT_IMGSZ:-1280}
+  PERSON_WEIGHTS: ${PERSON_WEIGHTS:-/models/yolo11n.pt}
+  PERSON_CONFIDENCE: ${PERSON_CONFIDENCE:-0.35}
+  PERSON_IMGSZ: ${PERSON_IMGSZ:-960}
+  INSIGHTFACE_MODEL: ${INSIGHTFACE_MODEL:-buffalo_l}
+  FACE_MATCH_THRESHOLD: ${FACE_MATCH_THRESHOLD:-0.45}
+  # Force RTSP over TCP: UDP media does not return reliably through Docker's bridge network.
+  OPENCV_FFMPEG_CAPTURE_OPTIONS: rtsp_transport;tcp
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-surveillance}
+      POSTGRES_USER: ${POSTGRES_USER:-surveillance}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [app]
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [app]
+
+  api:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      ConnectionStrings__Default: Host=postgres;Port=5432;Database=${POSTGRES_DB:-surveillance};Username=${POSTGRES_USER:-surveillance};Password=${POSTGRES_PASSWORD}
+      ConnectionStrings__Redis: redis:6379
+      Jwt__Key: ${JWT_KEY:?set JWT_KEY in .env (32+ chars)}
+      Jwt__ExpiryMinutes: ${JWT_EXPIRY_MINUTES:-60}
+      ServiceAuth__ApiKey: ${SERVICE_API_KEY:?set SERVICE_API_KEY in .env}
+      Database__AutoMigrate: "true"
+      Swagger__Enabled: ${SWAGGER_ENABLED:-false}
+      Cors__Origins__0: ${PUBLIC_WEB_ORIGIN:-http://localhost:8080}
+      # nginx (web) is the only proxy allowed to set X-Forwarded-For. Must match the app subnet below.
+      Proxy__TrustedProxies__0: 172.28.0.0/16
+      Retention__Days: ${RETENTION_DAYS:-7}
+      Storage__Provider: Local
+    volumes:
+      - snapshots:/data/snapshots
+      - dataprotection-keys:/app/keys
+    networks: [app]
+
+  web:
+    build:
+      context: ./frontend
+    restart: unless-stopped
+    depends_on:
+      - api
+    ports:
+      - "${WEB_PORT:-8080}:8080"
+    networks: [app]
+
+  monitoring:
+    build:
+      context: ./monitoring
+    restart: unless-stopped
+    depends_on:
+      - api
+    environment:
+      <<: *engine-env
+    volumes:
+      - ./models:/models:ro
+      - insightface-cache:/home/engine/.insightface
+    networks: [app]
+
+networks:
+  app:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+
+volumes:
+  postgres-data:
+  redis-data:
+  snapshots:
+  dataprotection-keys:
+  insightface-cache:
